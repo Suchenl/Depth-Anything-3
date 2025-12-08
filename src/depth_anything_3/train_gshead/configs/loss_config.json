@@ -1,0 +1,19 @@
+{
+    "lpips_loss": {
+        "use": true,
+        "weight": 1.0
+    },
+    "img_sim_loss": {
+        "use": true,
+        "norm": "L2",
+        "weight": 10.0
+    },
+    "depth_loss": {
+        "use": true,
+        "weight": 1.0
+    },
+    "motion_loss": {
+        "use": false,
+        "weight": 0.1
+    }
+}

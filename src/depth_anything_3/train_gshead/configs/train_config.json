@@ -1,0 +1,35 @@
+{
+    "random_seed": 0,
+    "num_workers": 8,
+    "num_epochs": 100,
+    "num_steps": null,
+    "ckpt": {
+        "read_path": null,
+        "save_freq_epoch": 5,
+        "save_freq_step": 10000,
+        "save_dir": "our_gshead/ckpts",
+        "exp_name": "v1"
+    },
+    "tensorboard": {
+        "use": true,
+        "log_dir": null
+    },
+    "validation": {
+        "use": true,
+        "freq_epoch": 5,
+        "freq_step": 10000
+    },
+    "visualization": {
+        "train": {
+            "use": true,
+            "every_epoch": 1,
+            "every_step": 50
+        },
+        "val": {
+            "use": true,
+            "every_epoch": 1,
+            "every_step": 50
+        }
+    },
+    "print_memory": false
+}

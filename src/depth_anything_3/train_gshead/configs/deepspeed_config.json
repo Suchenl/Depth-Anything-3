@@ -1,0 +1,68 @@
+{
+    "train_micro_batch_size_per_gpu": 1,
+    "gradient_accumulation_steps": 1,
+    "steps_per_print": 100,
+    "wall_clock_breakdown": false,
+    "fp16": {
+        "enabled": false,
+        "loss_scale": 0,
+        "initial_scale_power": 16,
+        "loss_scale_window": 1000,
+        "min_loss_scale": 1,
+        "hysteresis": 2
+    },
+    "bf16": {
+        "enabled": true
+    },
+    "communication_data_type": "bf16",
+    "zero_optimization": {
+        "stage": 2,
+        "allgather_partitions": true,
+        "reduce_scatter": true,
+        "contiguous_gradients": true,
+        "overlap_comm": true
+    },
+    "activation_checkpointing": {
+        "enabled": true,
+        "partition_activations": true,
+        "contiguous_memory_optimization": true,
+        "checkpoint_ratio": 0.5,
+        "number_checkpoints": null
+    },
+    "checkpoint": {
+        "enabled": true,
+        "save_interval": 1000,
+        "path": "./checkpoints",
+        "prefix": "model",
+        "save_optimizer": true,
+        "save_lr_scheduler": true
+    },
+    "pipeline": {
+        "enabled": false,
+        "micro_batch_size": 1,
+        "stages": "auto",
+        "schedule": "1f1b"
+    },
+    "optimizer": {
+        "type": "AdamW",
+        "params": {
+            "lr": 1e-4,
+            "betas": [
+                0.9,
+                0.999
+            ],
+            "eps": 1e-8,
+            "weight_decay": 1e-4
+        }
+    },
+    "scheduler": {
+        "type": "WarmupDecayLR",
+        "params": {
+            "warmup_min_lr": 1e-8,
+            "warmup_max_lr": 1e-4,
+            "warmup_num_steps": 100,
+            "total_num_steps": 1e6
+        }
+    },
+    "gradient_clipping": 1.0
+}
