@@ -66,7 +66,7 @@ gs_adapter:
 
   sh_degree: 2
   pred_color: false  # predict SH coefficient if false
-  pred_offset_depth: true
-  pred_offset_xy: true
+  pred_offset_depth: false
+  pred_offset_xy: false
   gaussian_scale_min: 1e-5
   gaussian_scale_max: 30.0
