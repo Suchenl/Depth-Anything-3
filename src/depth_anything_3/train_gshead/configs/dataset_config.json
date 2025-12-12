@@ -1,0 +1,7 @@
+{
+    "DL3DV-10K": {
+        "dataset_path": "/public/chenyuzhuo/DATASETS/Video_DATASETS/DL3DV-10K/main",
+        "resolution": "480P",
+        "downsample": 8
+    }
+}

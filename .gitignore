@@ -33,3 +33,12 @@ input_images*/
 src/debug_main.py
 temp*.png
 /outputs
+
+# added files
+inference
+src/depth_anything_3/app
+scripts
+logs
+ckpts
+verification
+*.sh

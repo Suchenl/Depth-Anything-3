@@ -28,15 +28,15 @@ import torch.nn as nn
 from huggingface_hub import PyTorchModelHubMixin
 from PIL import Image
 
-from depth_anything_3.cfg import create_object, load_config
-from depth_anything_3.registry import MODEL_REGISTRY
-from depth_anything_3.specs import Prediction
-from depth_anything_3.utils.export import export
-from depth_anything_3.utils.geometry import affine_inverse
-from depth_anything_3.utils.io.input_processor import InputProcessor
-from depth_anything_3.utils.io.output_processor import OutputProcessor
-from depth_anything_3.utils.logger import logger
-from depth_anything_3.utils.pose_align import align_poses_umeyama
+from .cfg import create_object, load_config
+from .registry import MODEL_REGISTRY
+from .specs import Prediction
+from .utils.export import export
+from .utils.geometry import affine_inverse
+from .utils.io.input_processor import InputProcessor
+from .utils.io.output_processor import OutputProcessor
+from .utils.logger import logger
+from .utils.pose_align import align_poses_umeyama
 
 torch.backends.cudnn.benchmark = False
 # logger.info("CUDNN Benchmark Disabled")
@@ -86,9 +86,9 @@ class DepthAnything3(nn.Module, PyTorchModelHubMixin):
 
         # Build the underlying network
         print(f"MODEL_REGISTRY: {MODEL_REGISTRY}")
-        if 'align_3dgs' in kwargs.keys() and kwargs['align_3dgs']:
-            print(f"kwargs['align_3dgs']: {kwargs['align_3dgs']}")
-            self.model_name += '-align3dgs'
+        if 'new_gshead' in kwargs.keys():
+            print(f"kwargs['new_gshead']: {kwargs['new_gshead']}")
+            self.model_name += '-newgshead'
         print(f"Initialized model in 'api.py' | model_name: {self.model_name}")
         
         self.config = load_config(MODEL_REGISTRY[self.model_name])
@@ -111,7 +111,6 @@ class DepthAnything3(nn.Module, PyTorchModelHubMixin):
         export_feat_layers: list[int] | None = None,
         infer_gs: bool = False,
         use_ray_pose: bool = False,
-        ref_view_strategy: str = "saddle_balanced",
     ) -> dict[str, torch.Tensor]:
         """
         Forward pass through the model.
@@ -123,7 +122,6 @@ class DepthAnything3(nn.Module, PyTorchModelHubMixin):
             export_feat_layers: Layer indices to return intermediate features for.
             infer_gs: Enable Gaussian Splatting branch.
             use_ray_pose: Use ray-based pose estimation instead of camera decoder.
-            ref_view_strategy: Strategy for selecting reference view from multiple views.
 
         Returns:
             Dictionary containing model predictions
@@ -133,7 +131,7 @@ class DepthAnything3(nn.Module, PyTorchModelHubMixin):
         with torch.no_grad():
             with torch.autocast(device_type=image.device.type, dtype=autocast_dtype):
                 return self.model(
-                    image, extrinsics, intrinsics, export_feat_layers, infer_gs, use_ray_pose, ref_view_strategy
+                    image, extrinsics, intrinsics, export_feat_layers, infer_gs, use_ray_pose
                 )
 
     def inference(
@@ -144,7 +142,6 @@ class DepthAnything3(nn.Module, PyTorchModelHubMixin):
         align_to_input_ext_scale: bool = True,
         infer_gs: bool = False,
         use_ray_pose: bool = False,
-        ref_view_strategy: str = "saddle_balanced",
         render_exts: np.ndarray | None = None,
         render_ixts: np.ndarray | None = None,
         render_hw: tuple[int, int] | None = None,
@@ -172,9 +169,6 @@ class DepthAnything3(nn.Module, PyTorchModelHubMixin):
             align_to_input_ext_scale: whether to align the input pose scale to the prediction
             infer_gs: Enable the 3D Gaussian branch (needed for `gs_ply`/`gs_video` exports)
             use_ray_pose: Use ray-based pose estimation instead of camera decoder (default: False)
-            ref_view_strategy: Strategy for selecting reference view from multiple views.
-                Options: "first", "middle", "saddle_balanced", "saddle_sim_range".
-                Default: "saddle_balanced". For single view input (S ≤ 2), no reordering is performed.
             render_exts: Optional render extrinsics for Gaussian video export
             render_ixts: Optional render intrinsics for Gaussian video export
             render_hw: Optional render resolution for Gaussian video export
@@ -213,7 +207,7 @@ class DepthAnything3(nn.Module, PyTorchModelHubMixin):
         export_feat_layers = list(export_feat_layers) if export_feat_layers is not None else []
 
         raw_output = self._run_model_forward(
-            imgs, ex_t_norm, in_t, export_feat_layers, infer_gs, use_ray_pose, ref_view_strategy
+            imgs, ex_t_norm, in_t, export_feat_layers, infer_gs, use_ray_pose
         )
 
         # Convert raw output to prediction
@@ -378,7 +372,6 @@ class DepthAnything3(nn.Module, PyTorchModelHubMixin):
         export_feat_layers: Sequence[int] | None = None,
         infer_gs: bool = False,
         use_ray_pose: bool = False,
-        ref_view_strategy: str = "saddle_balanced",
     ) -> dict[str, torch.Tensor]:
         """Run model forward pass."""
         device = imgs.device
@@ -387,7 +380,7 @@ class DepthAnything3(nn.Module, PyTorchModelHubMixin):
             torch.cuda.synchronize(device)
         start_time = time.time()
         feat_layers = list(export_feat_layers) if export_feat_layers is not None else None
-        output = self.forward(imgs, ex_t, in_t, feat_layers, infer_gs, use_ray_pose, ref_view_strategy)
+        output = self.forward(imgs, ex_t, in_t, feat_layers, infer_gs, use_ray_pose)
         if need_sync:
             torch.cuda.synchronize(device)
         end_time = time.time()

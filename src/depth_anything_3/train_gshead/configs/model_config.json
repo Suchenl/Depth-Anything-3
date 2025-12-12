@@ -1,0 +1,17 @@
+{
+    "model_name": "DA3-GIANT",
+    "align_3dgs": true,
+    "normal_ckpt_path": "./ckpt/da3-giant-no3dgs/model.safetensors",
+    "load_normal_ckpt": true,
+    "freeze_main": true,
+    "load_ckpt": {
+        "enabled": true,
+        "choice": "normal",
+        "normal": {
+            "ckpt_path": "./ckpt/da3-giant-no3dgs/model.safetensors"
+        },
+        "deepspeed": {
+            "ckpt_path": null
+        }
+    }
+}

@@ -1,19 +1,38 @@
 {
-    "lpips_loss": {
-        "use": true,
-        "weight": 1.0
-    },
-    "img_sim_loss": {
-        "use": true,
-        "norm": "L2",
-        "weight": 10.0
+    "rendering_loss": {
+        "lpips_loss": {
+            "enabled": true,
+            "weight": 1.0
+        },
+        "mse_loss": {
+            "enabled": true,
+            "weight": 1.0
+        }
     },
     "depth_loss": {
-        "use": true,
-        "weight": 1.0
+        "l1_loss": {
+            "enabled": true,
+            "weight": 1.0
+        },
+        "grad_loss": {
+            "enabled": false,
+            "weight": 1.0
+        }
+    },
+    "dynamic_loss": {
+        "dice_loss": {
+            "enabled": false,
+            "weight": 1.0
+        }
     },
     "motion_loss": {
-        "use": false,
-        "weight": 0.1
+        "mol_loss": {
+            "enabled": false,
+            "weight": 1.0
+        },
+        "l1_loss": {
+            "enabled": false,
+            "weight": 1.0
+        }
     }
 }

@@ -3,30 +3,41 @@
     "num_workers": 8,
     "num_epochs": 100,
     "num_steps": null,
+    "train_data": {
+        "dataset_name": "DL3DV-10K",
+        "process_res": 504,
+        "process_res_method": "upper_bound_resize"
+    },
+    "validation": {
+        "enabled": false,
+        "freq_epoch": 5,
+        "freq_step": 1,
+        "process_res": 504,
+        "process_res_method": "upper_bound_resize",
+        "split_from_train": true,
+        "split_num": 206,
+        "split_ratio": null,
+        "import_from_external": {
+            "dataset_name": null
+        }
+    },
     "ckpt": {
         "read_path": null,
         "save_freq_epoch": 5,
         "save_freq_step": 10000,
-        "save_dir": "our_gshead/ckpts",
-        "exp_name": "v1"
-    },
-    "tensorboard": {
-        "use": true,
+        "save_dir": "ckpts/train_aligned_3dgshead",
+        "exp_name": "v1",
+        "enable_tensorboard": true,
         "log_dir": null
-    },
-    "validation": {
-        "use": true,
-        "freq_epoch": 5,
-        "freq_step": 10000
     },
     "visualization": {
         "train": {
-            "use": true,
+            "enabled": true,
             "every_epoch": 1,
-            "every_step": 50
+            "every_step": 1
         },
         "val": {
-            "use": true,
+            "enabled": true,
             "every_epoch": 1,
             "every_step": 50
         }

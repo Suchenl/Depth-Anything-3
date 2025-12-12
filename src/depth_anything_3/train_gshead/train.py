@@ -26,7 +26,10 @@ from torch.utils.tensorboard import SummaryWriter
 from huggingface_hub import PyTorchModelHubMixin
 
 # import models
-from .depth_anything_3.model import da3
+from .model import DepthAnything3
+from .dataset import TrainDA3Static3DGSDataset, split_val_dataset
+
+# import utils
 from depth_anything_3.cfg import create_object, load_config
 from depth_anything_3.registry import MODEL_REGISTRY
 from depth_anything_3.specs import Prediction
@@ -36,12 +39,10 @@ from depth_anything_3.utils.io.output_processor import OutputProcessor
 from depth_anything_3.utils.logger import logger
 from depth_anything_3.utils.pose_align import align_poses_umeyama
 
-torch.backends.cudnn.benchmark = False
-
 # import my utils
 from .dataset import ...
 
-from sus_utils.train_utils import (
+from .utils.train_utils import (
     make_deterministic, 
     set_requires_grad,
     optimize_params, 
@@ -50,15 +51,14 @@ from sus_utils.train_utils import (
     update_checkpoints_savedir
     )
 
-from sus_utils.io_utils import (
+from .utils.io_utils import (
     parse_args,
     save_namespace_to_json,
     tensor_to_pil,
     namespace_to_dict
     )
 
-from sus_utils.differentiable.flow_utils import flow_transforms
-from sus_utils.differentiable.loss_functions import LPIPSLoss, PixelSimLoss
+from .utils.loss_functions import LPIPSLoss, DiceLoss, MixtureOfLaplaceLoss
 
 
 def handler(signum, frame):
@@ -86,48 +86,33 @@ def get_filtered_model_state_dict(model):
     }
     return filtered_state_dict
 
-def train(args, device):
-    # Initialize the random generator
-    g_cuda = torch.Generator(device=device)
-    
+
+def prepare_datas(args, generator: Optional[torch.Generator] = None):
     # Define dataset and dataloader
-    image_transform = transforms.Compose([
-        transforms.ToTensor(),
-        # transforms.Resize((args.model_config.img_height, args.model_config.img_width)),
-        transforms.RandomHorizontalFlip(p=0.5), # Randomly flip the image horizontally with a probability of 0.5
-        transforms.RandomResizedCrop(
-            size=(args.model_config.img_height, args.model_config.img_width), 
-            scale=(0.8, 1.0),  # Crop between 80% to 100% of the original image area
-            ratio=(0.9, 1.1)   # Aspect ratio of the crop will be between 0.9 to 1.1
-        ),
-        transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2), # Randomly adjust brightness, contrast, and saturation
-        transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]), # Normalize the image with mean and standard deviation
-        ])
-    motion_transform = transforms.Compose([
-        flow_transforms.ToTensor(),
-        flow_transforms.Resize(out_H=args.model_config.img_height, out_W=args.model_config.img_width, rescale=args.model_config.choices.rescale_motion),
-        flow_transforms.RandomHorizontalFlip(p=0.5),
-        flow_transforms.RandomVerticalFlip(p=0.5),
-        flow_transforms.RamdomSignFlip(p=0.5),
-        ])
-    mask_transform = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Resize((args.model_config.img_height, args.model_config.img_width)),
-        ])
-    train_dataset = UnpairedImageMotionMaskDataset(
-        image_dir_list=args.data_config.image_dir_list,
-        motion_dir_list=args.data_config.motion_dir_list,
-        mask_dir_list=args.data_config.mask_dir_list,
-        image_root_list=args.data_config.image_root_list,
-        motion_root_list=args.data_config.motion_root_list,
-        mask_root_list=args.data_config.mask_root_list,
-        image_transform=image_transform,
-        motion_transform=motion_transform,
-        mask_transform=mask_transform
+    train_dataset = DA3Training3DGSDataset(
+        dataset_name=args.train_config.train_data.dataset_name, 
+        dataset_path=args.train_config.train_data.dataset_path,
+        process_res=args.train_config.train_data.process_res,
+        process_res_method=args.train_config.train_data.process_res_method
         )
+
+    if args.train_config.validation.enabled:
+        if args.train_config.validation.split_from_train:
+            val_dataset, train_dataset = split_val_dataset(
+                dataset=train_dataset,
+                split_num=args.train_config.validation.split_num,
+                split_ratio=args.train_config.validation.split_ratio,
+                generator=generator)
+        else: raise NotImplementedError("Not implemented yet")
+        
+        val_num = len(val_dataset)
+        print('val_num:', val_num)
+    
     train_num = len(train_dataset)
     print('train_num:', train_num)
-    # ==================== Calculate the number of total_steps ============================
+
+    
+    # Calculate the number of total_steps
     num_gpus = dist.get_world_size()
     per_gpu_batch_size = args.deepspeed_config['train_micro_batch_size_per_gpu']
     global_batch_size = per_gpu_batch_size * num_gpus * args.deepspeed_config['gradient_accumulation_steps']
@@ -136,7 +121,9 @@ def train(args, device):
     if "scheduler" in args.deepspeed_config.keys():
         args.deepspeed_config["scheduler"]["params"]["total_num_steps"] = total_num_steps
         print(f"Dynamically setting scheduler 'total_num_steps' to {total_num_steps}")
-    # ==================== DeepSpeed Modification 2: Use DistributedSampler ============================
+        
+    # DeepSpeed Need: Use DistributedSampler
+    ## Use DistributedSampler for the training set
     train_sampler = DistributedSampler(train_dataset)
     # Use sampler in DataLoader and shuffle 'must be' False
     train_dataloader = DataLoader(train_dataset, 
@@ -144,186 +131,151 @@ def train(args, device):
                                   sampler=train_sampler,
                                   shuffle=False, # Sampler handles shuffle.
                                   num_workers=args.train_config.num_workers)
-    # ==================================================================================================
     args.train_config.total_steps = len(train_dataloader) * args.train_config.num_epochs
-    
-    if args.data_config.validation:
-        val_num = len(val_dataset)
-        print('val_num:', val_num)
-        # CRUCIAL: Use DistributedSampler for the validation set as well
+
+    ## Use DistributedSampler for the validation set as well
+    if args.train_config.validation.enabled:
         val_sampler = DistributedSampler(val_dataset, shuffle=False) # shuffle=False for consistent evaluation
         val_dataloader = DataLoader(val_dataset, 
                                     batch_size=per_gpu_batch_size, 
                                     sampler=val_sampler, # Use the sampler
                                     num_workers=args.train_config.num_workers)
-    
-    # initialize model, optimizer and loss functions
-    # ==================== DeepSpeed Modification 3: Initialize the model and the VAE separately. =================
-    zero_stage = args.deepspeed_config.get("zero_optimization", {}).get("stage", 0)
-    ## main model
-    # if zero_stage == 3:
-    #     print("ZeRO Stage 3 detected. Using deepspeed.zero.Init for memory-efficient model initialization.")
-    #     with deepspeed.zero.Init(config_dict_or_path=args.deepspeed_config):
-    #         model = ImageMotionTracker(args.model_config)
-    # else:
-    #     print(f"ZeRO Stage is {zero_stage}. Using standard initialization for the main model.")
-    #     model = ImageMotionTracker(args.model_config)
-    #     if args.model_config.load_normal_ckpt and args.model_config.normal_ckpt_path is not None:
-    #         ckpt = torch.load(args.model_config.normal_ckpt_path, map_location=device)
-    #         if "model_state_dict" in ckpt.keys():
-    #             print(f"Load normal checkpoint for model | from {args.model_config.normal_ckpt_path}:\n\t", model.load_state_dict(ckpt["model_state_dict"], strict=False))
-    #         else:
-    #             print(f"Load normal checkpoint for model | from {args.model_config.normal_ckpt_path}:\n\t", model.load_state_dict(ckpt, strict=False))
-    #         del ckpt
-    model = ImageMotionTracker(args.model_config)
-    if args.model_config.load_normal_ckpt and args.model_config.normal_ckpt_path is not None:
-        ckpt = torch.load(args.model_config.normal_ckpt_path, map_location=device)
-        if "model_state_dict" in ckpt.keys():
-            print(f"Load normal checkpoint for model | from {args.model_config.normal_ckpt_path}:\n\t", model.load_state_dict(ckpt["model_state_dict"], strict=False))
-        else:
-            print(f"Load normal checkpoint for model | from {args.model_config.normal_ckpt_path}:\n\t", model.load_state_dict(ckpt, strict=False))
-        del ckpt
-
-    ## VAE
-    print("Initializing auxiliary VAE model...")
-    if args.model_config.vae.use:
-        vae = AutoencoderKL.from_pretrained(args.model_config.vae.ckpt_path)
-        vae.to(device)
-        for param in vae.parameters():
-            param.requires_grad = False
-        vae.eval()
-        if args.deepspeed_config.get("fp16", False).get("enabled", False):
-            vae.half()
-        elif args.deepspeed_config.get("bf16", False).get("enabled", False):
-            vae.bfloat16()
     else:
-        vae = None
-    # =============================================================================================================
-    ### optimizer
-    train_param = []
-    for name, param in model.named_parameters():
-        if param.requires_grad:
-            train_param.append(param)
-    # ============================== DeepSpeed Modification 4: Use deepspeed.initialize ======================
+        val_dataloader = None
+        
+    return train_dataloader, val_dataloader
+
+def prepare_model_engine(args, device):
+    # Initialize the model
+    model = DepthAnything3(model_name=args.model_config.model_name, align_3dgs=args.model_config.align_3dgs)
+
+    # Freeze the specific parameters
+    if args.model_config.freeze_main:
+        train_param = []
+        for name, param in model.named_parameters():
+            if 'gs_head' in name:
+                train_param.append(param)
+            else:
+                param.requires_grad = False
+        print(f"Freeze the parameters except gs_head")
+    else: 
+        train_param = model.parameters()
+        
+    # Load the model from normal checkpoint if specified
+    if args.model_config.load_ckpt.enabled and args.model_config.load_ckpt.choice == 'normal':
+        assert args.model_config.normal.ckpt_path is not None, "normal_ckpt_path must be specified when load_ckpt.enabled is 'true' & load_ckpt.choice is 'normal'"
+        ckpt = torch.load(args.model_config.normal_ckpt_path, map_location=device)
+        if "model_state_dict" in ckpt.keys(): print(f"Load normal checkpoint for model | from {args.model_config.normal_ckpt_path}:\n\t", model.load_state_dict(ckpt["model_state_dict"], strict=False))
+        else: print(f"Load normal checkpoint for model | from {args.model_config.normal_ckpt_path}:\n\t", model.load_state_dict(ckpt, strict=False))
+
     # Use deepspeed.initialize to wrap all components uniformly
-    # It automatically handles model and data movement to the GPU, blended accuracy, ZeRO optimization, and more!
+    # It automatically handles model and data movement to the GPU, blended accuracy, ZeRO optimization
     model_engine, optimizer, _, scheduler = deepspeed.initialize(
         model=model,
         model_parameters=train_param,
         optimizer=None,
         lr_scheduler=None,
         config=args.deepspeed_config)
-    # =========================================================================================================
+
     # The DeepSpeed way to load checkpoint
-    if args.train_config.checkpoint_path is not None:
+    start_epoch = 0
+    start_step = 0
+    if args.model_config.load_ckpt.enabled and args.model_config.load_ckpt.choice == 'deepspeed':
         # load_checkpoint handles model, optimizer, and scheduler states automatically.
         # It also returns a client_state dictionary for things like epoch or step number.
-
-        print("Scanning and recording original grad states for 'iqe' module...")
-        original_iqe_grad_states = {}
-        for name, param in model_engine.module.named_parameters():
-            if name.startswith('iqe.'):
-                original_iqe_grad_states[name] = param.requires_grad
-                param.requires_grad = True
-                print(f"  -> Recorded '{name}' (original: requires_grad={original_iqe_grad_states[name]}). Temporarily set to True.")
-                
-        load_path, client_state = model_engine.load_checkpoint(args.train_config.checkpoint_path, load_module_strict=False)
-
-        print("\nRestoring original grad states for 'iqe' module...")
-        if not original_iqe_grad_states:
-            print("  -> No 'iqe' parameters were recorded, nothing to restore.")
-        else:
-            for name, param in model_engine.module.named_parameters():
-                if name in original_iqe_grad_states:
-                    original_state = original_iqe_grad_states[name]
-                    param.requires_grad = original_state
-                    print(f"  -> Restored '{name}' to requires_grad={original_state}.")
-        
+        load_path, client_state = model_engine.load_checkpoint(
+            args.model_config.load_ckpt.deepspeed.ckpt_path, 
+            load_module_strict=False
+            )
         if client_state is not None:
             start_epoch = client_state.get('epoch_num', 0)
             start_step = client_state.get('step_num', 0)
             print(f"Loaded checkpoint from {load_path}. Resuming from epoch {start_epoch}, step {start_step}")
-        else:
-            start_epoch = 0
-            start_step = 0
-            print(f"Loaded checkpoint from {args.train_config.checkpoint_path}, but client_state is None")
-    else:
-        start_epoch = 0
+        else: print(f"Loaded checkpoint from {args.model_config.load_ckpt.deepspeed.ckpt_path}, but client_state is None")
+
+    return model_engine, optimizer, scheduler, start_epoch, start_step
+
+def prepare_loss_functions(args, device):
+    class LossFunctions:
+        def __init__(self, args, device):
+            funcs = {}
+            # Rendering Loss
+            if args.loss_config.rendering_loss.enabled:
+                if args.loss_config.rendering_loss.lpips_loss.enabled:
+                    funcs['render_lpips_loss']['func'] = LPIPSLoss(net='alex', device=device)
+                    funcs['render_lpips_loss']['weight'] = args.loss_config.rendering_loss.lpips_loss.weight
+                if args.loss_config.rendering_loss.mse_loss.enabled:
+                    funcs['render_mse_loss']['func'] = nn.MSELoss().to(device)
+                    funcs['render_mse_loss']['weight'] = args.loss_config.rendering_loss.mse_loss.weight
+
+            # Depth Loss
+            if args.loss_config.depth_loss.enabled:
+                if args.loss_config.depth_loss.l1_loss.enabled:
+                    funcs['depth_l1_loss']['func'] = nn.L1Loss().to(device)
+                    funcs['depth_l1_loss']['weight'] = args.loss_config.depth_loss.l1_loss.weight
+                if args.loss_config.depth_loss.grad_loss.enabled:
+                    funcs['depth_grad_loss']['func'] = nn.L1Loss().to(device)
+                    funcs['depth_grad_loss']['weight'] = args.loss_config.depth_loss.grad_loss.weight
+
+            # Dynamic Loss
+            if args.loss_config.dynamic_loss.enabled:
+                if args.loss_config.dynamic_loss.dice_loss.enabled:
+                    funcs['dynamic_dice_loss']['func'] = DiceLoss().to(device)
+                    funcs['dynamic_dice_loss']['weight'] = args.loss_config.dynamic_loss.dice_loss.weight
+
+            # Motion Loss
+            if args.loss.config.motion_loss.enabled:
+                if args.loss_config.motion_loss.mol_loss.enabled:
+                    funcs['motion_mol_loss']['func'] = MixtureOfLaplaceLoss().to(device)
+                    funcs['motion_mol_loss']['weight'] = args.loss_config.motion_loss.mol_loss.weight
+                if args.loss_config.motion_loss.l1_loss.enabled:
+                    funcs['motion_l1_loss']['func'] = nn.L1Loss().to(device)
+                    funcs['motion_l1_loss']['weight'] = args.loss_config.motion_loss.l1_loss.weight
+
+            self.funcs = funcs
+
+        def __call__(self, loss_name, *args, **kwargs):
+            return self.funcs[loss_name]['func'](*args, **kwargs) * self.funcs[loss_name]['weight']
+                
+    return LossFunctions(args, device)
+
+def run_one_epoch(args, epoch, model_engine, optimizer, train_dataloader, val_dataloader, loss_functions, device, writer):
+
     
-    ## net_disc
-    if args.loss_config.gan_loss.use:
-        # Step 1: Initialize the Discriminator.
-        # DeepSpeed will place it on the correct device.
-        net_disc = Discriminator(in_channels=args.model_config.disc_model.in_channels, 
-                                disc_scale=args.model_config.disc_model.disc_scale)
-        # Step 2: Initialize its optimizer and scheduler
-        param_disc = list(net_disc.parameters())
-        # Step 3: Create a SEPARATE DeepSpeed engine for the Discriminator
-        # You can reuse the same deepspeed_config or use a different one if needed
-        disc_engine, optimizer_disc, _, scheduler_disc = deepspeed.initialize(
-            model=net_disc,
-            model_parameters=param_disc,
-            optimizer=None,
-            lr_scheduler=None,
-            config=args.deepspeed_config)
-        ### read checkpoint
-        if args.train_config.disc_checkpoint_path is not None:
-            disc_load_path, _ = disc_engine.load_checkpoint(args.train_config.disc_checkpoint_path, load_module_strict=False)
-            if disc_client_state is not None:
-                print(f"Loaded discriminator checkpoint from {disc_load_path}")
-    else:
-        disc_engine = None
-        
-    # init loss functions
-    # lpips_loss_fn = LPIPSLoss(net='vgg', device=device)
-    if args.loss_config.lpips_loss.use:
-        lpips_loss_fn = LPIPSLoss(net='alex', device=device)
+def train(args, device):
+    # Initialize the random generator
+    g_cuda = torch.Generator(device=device)
+    
+    # Prepare Datas
+    train_dataloader, val_dataloader = prepare_datas(args, g_cuda)
+    
+    # Initialize the model, optimizer and loss functions
+    model_engine, optimizer, scheduler, start_epoch, start_step = prepare_model_engine(args, device)
 
-    if args.loss_config.img_sim_loss.use:
-        if args.loss_config.img_sim_loss.channel_weight.use:
-            channel_weight = torch.tensor([args.loss_config.img_sim_loss.channel_weight.R,
-                                        args.loss_config.img_sim_loss.channel_weight.G,
-                                        args.loss_config.img_sim_loss.channel_weight.B])
-        else:
-            channel_weight = torch.tensor([1.0, 1.0, 1.0])
-        img_sim_loss_fn = PixelSimLoss(norm=args.loss_config.img_sim_loss.norm, 
-                                    channel_weight=channel_weight,
-                                    device=device)
-        
-    if args.loss_config.gan_loss.use:
-        gan_loss_fn = GANLoss(use_label_smoothing=args.loss_config.gan_loss.use_label_smoothing,
-                            smooth_real=args.loss_config.gan_loss.smooth_real,
-                            smooth_fake=args.loss_config.gan_loss.smooth_fake).to(device)
-        gan_loss_fn.device = device
+    # Prepare the loss functions
+    loss_functions = prepare_loss_functions(args, device)
 
-    # ==================== DeepSpeed Modification 5: Initialize the writer and bar. =================
-    # # Create tensorboard writer
-    # writer = initialize_tensorboard_writer(args.train_config)
+    # Initialize the bar and writer
     # Only the master process (rank 0) creates the TensorBoard writer and tqdm progress bars.
     if model_engine.global_rank == 0:
-        writer = initialize_tensorboard_writer(args.train_config)
         bar = tqdm(train_dataloader, desc='Training Steps')
-    else:
-        bar = train_dataloader # Other processes only iterate over the data, no progress bar is displayed
-    # ===============================================================================================
+        if args.train_config.ckpt.enable_tensorboard:
+            writer, log_dir = initialize_tensorboard_writer(log_dir=args.train_config.ckpt.log_dir, 
+                                                            ckpt_path=args.train_config.ckpt.read_path,
+                                                            ckpt_savedir=args.train_config.ckpt.save_dir)
+            args.train_config.ckpt.log_dir = log_dir
+    else: bar = train_dataloader # Other processes only iterate over the data, no progress bar is displayed
+
     # Cycle epoch nums
     for epoch in range(start_epoch, start_epoch + args.train_config.num_epochs):
-        # CRITICAL: Set the seed at the start of each epoch.
-        # This makes augmentations different per epoch, but identical
-        # across all GPUs within the same epoch.
         g_cuda.manual_seed(args.train_config.random_seed + epoch)
     
         # Training
         train_sampler.set_epoch(epoch) # <--- 11. Ensure that the shuffle is different for each epoch.
-        # bar = tqdm(train_dataloader, desc='Training Steps')
         epoch_loss = 0
         disc_epoch_loss = 0
         loss_add_times = 0
-        set_requires_grad(model_engine.module, True)
         model_engine.train()
-        if args.loss_config.gan_loss.use:
-            set_requires_grad(disc_engine.module, False)
-            disc_engine.eval()
 
         if args.train_config.print_memory:
             if torch.cuda.is_available():
@@ -333,16 +285,19 @@ def train(args, device):
             # Get data
             cover_img, init_flow = datas[0].to(device), datas[1].to(device)
             B, C, H, W = cover_img.shape
-            # Training process
-            content_mask = None
-            # content_mask = torch.ones([B, 1, H, W], device=device, dtype=torch.bool)
-            # ==================== DeepSpeed Modification 6: Training. =================
-            # output = model(cover_img, init_flow=init_flow, content_mask=content_mask, calc_loss=True, vae=vae)
+
             if args.deepspeed_config.get('fp16', False).get('enabled', False):
                 cover_img, init_flow = cover_img.half(), init_flow.half()
             elif args.deepspeed_config.get('bf16', False).get('enabled', False):
                 cover_img, init_flow = cover_img.bfloat16(), init_flow.bfloat16()
-            output = model_engine(cover_img, init_flow=init_flow, content_mask=content_mask, calc_loss=True, vae=vae, generator=g_cuda)
+            output = model_engine(image,
+                                  extrinsics,
+                                  intrinsics,
+                                  export_feat_layers, 
+                                  infer_gs=True, 
+                                  use_ray_pose=True, 
+                                  ref_view_strategy="first")
+            
             enc_img = output['enc_img']
             
             # # ============= test motion enhancer ================
@@ -353,17 +308,17 @@ def train(args, device):
             
             # 1.train main model
             ## (1) Calculate the image losses
-            if args.loss_config.img_sim_loss.use:
+            if args.loss_config.img_sim_loss.enabled:
                 loss_img_sim = img_sim_loss_fn(enc_img, cover_img)
             else:
                 loss_img_sim = torch.tensor(0.0, device=device)
                 
-            if args.loss_config.lpips_loss.use:
+            if args.loss_config.lpips_loss.enabled:
                 loss_lpips = lpips_loss_fn(enc_img, cover_img)
             else:
                 loss_lpips = torch.tensor(0.0, device=device)
                 
-            if args.loss_config.gan_loss.use:
+            if args.loss_config.gan_loss.enabled:
                 disc_fake_out = disc_engine(enc_img)
                 loss_disc_enc = gan_loss_fn(disc_fake_out['global_disc'], True) * args.model_config.disc_model.global_weight + \
                                 gan_loss_fn(disc_fake_out['local_disc'], True) * args.model_config.disc_model.local_weight
@@ -375,19 +330,19 @@ def train(args, device):
                         loss_disc_enc * args.loss_config.gan_loss.weight 
                         
             ## (2) Calculate the motion losses
-            if args.loss_config.motion_loss.use:
+            if args.loss_config.motion_loss.enabled:
                 loss_motion = output['loss_motion'] * args.loss_config.motion_loss.weight
             else:
                 loss_motion = torch.tensor(0.0, device=device)
                 
             ## (3) Calculate the content losses
-            if args.loss_config.content_loss.use:
+            if args.loss_config.content_loss.enabled:
                 loss_content = output['loss_content'] * args.loss_config.content_loss.weight
             else:
                 loss_content = torch.tensor(0.0, device=device)
                 
             ## (4) Calculate the template loss
-            if args.loss_config.template_loss.use:
+            if args.loss_config.template_loss.enabled:
                 loss_tpl = output['loss_tpl']
             else:
                 loss_tpl = torch.tensor(0.0, device=device)
@@ -399,7 +354,7 @@ def train(args, device):
             model_engine.step()
             ## If EMA is enabled in the config, this will overwrite the optimizer's update
             model_engine.perform_ema_update()
-            if args.loss_config.gan_loss.use:
+            if args.loss_config.gan_loss.enabled:
                 # 2. train net_disc
                 # We need to freeze the main model (generator) parameters
                 set_requires_grad(model_engine.module, False)
@@ -450,18 +405,18 @@ def train(args, device):
                                     )
                 # Update tensorboard
                 writer.add_scalar(f'Training (step) -model- Loss', loss.item(), model_engine.global_steps - 1)
-                if args.loss_config.img_sim_loss.use:
+                if args.loss_config.img_sim_loss.enabled:
                     writer.add_scalar(f'Training (step) -model- Loss_img_sim', loss_img_sim.item(), model_engine.global_steps - 1)
-                if args.loss_config.lpips_loss.use:
+                if args.loss_config.lpips_loss.enabled:
                     writer.add_scalar(f'Training (step) -model- Loss_lpips', loss_lpips.item(), model_engine.global_steps - 1)
-                if args.loss_config.motion_loss.use:
+                if args.loss_config.motion_loss.enabled:
                     writer.add_scalar(f'Training (step) -model- Loss_motion', loss_motion.item(), model_engine.global_steps - 1)
-                if args.loss_config.content_loss.use:
+                if args.loss_config.content_loss.enabled:
                     writer.add_scalar(f'Training (step) -model- Loss_content', loss_content.item(), model_engine.global_steps - 1)
-                if args.loss_config.gan_loss.use:
+                if args.loss_config.gan_loss.enabled:
                     writer.add_scalar(f'Training (step) -Net_Disc- Loss', loss_net_disc.item(), disc_engine.global_steps - 1)
                     writer.add_scalar(f'Training (step) -model- Loss_disc_enc', loss_disc_enc.item(), model_engine.global_steps - 1)
-                if args.loss_config.template_loss.use:
+                if args.loss_config.template_loss.enabled:
                     writer.add_scalar(f'Training (step) -model- Loss_template', loss_tpl.item(), model_engine.global_steps - 1)
 
                 # Visualize samples for rank 0
@@ -492,7 +447,7 @@ def train(args, device):
         disc_epoch_loss = disc_epoch_loss / loss_add_times
         if model_engine.global_rank == 0:
             writer.add_scalar(f'Training (epoch) -model- Loss', epoch_loss, epoch)
-            if args.loss_config.gan_loss.use:
+            if args.loss_config.gan_loss.enabled:
                 writer.add_scalar(f'Training (epoch) -Net_Disc- Loss', disc_epoch_loss, epoch)
             bar.set_description("Train epoch[{}/{}] loss_model:{:.3f} loss_net_disc:{:.3f}".format(epoch, 
                                                                                                 start_epoch + args.train_config.num_epochs - 1, 
@@ -513,7 +468,7 @@ def train(args, device):
         if args.data_config.validation and epoch % args.train_config.val_freq_epoch == 0:
             def validate_model():
                 model_engine.eval()
-                if args.loss_config.gan_loss.use:
+                if args.loss_config.gan_loss.enabled:
                     disc_engine.eval()
                 # These accumulators are now on EACH process
                 total_loss_model = 0.0
@@ -536,7 +491,7 @@ def train(args, device):
                         ## (1) Calculate the image losses
                         loss_img_sim = img_sim_loss_fn(enc_img, cover_img)
                         loss_lpips = lpips_loss_fn(enc_img, cover_img)
-                        if args.loss_config.gan_loss.use:
+                        if args.loss_config.gan_loss.enabled:
                             disc_fake_out = disc_engine(enc_img)
                             loss_disc_enc = gan_loss_fn(disc_fake_out['global_disc'], True) * args.model_config.disc_model.global_weight + \
                                             gan_loss_fn(disc_fake_out['local_disc'], True) * args.model_config.disc_model.local_weight
@@ -550,13 +505,13 @@ def train(args, device):
                         ## (3) Calculate the content losses
                         loss_content = output['loss_content'] * args.loss_config.content_loss.weight
                         ## (4) Calculate the template loss
-                        if args.loss_config.template_loss.use:
+                        if args.loss_config.template_loss.enabled:
                             loss_tpl = output['loss_tpl']
                         else:
                             loss_tpl = torch.tensor(0.0, device=device)
                         ## (5) Calculate the total loss
                         loss = loss_img + loss_motion + loss_content + loss_tpl * args.loss_config.template_loss.weight
-                        if args.loss_config.gan_loss.use:
+                        if args.loss_config.gan_loss.enabled:
                             disc_real_out = net_disc(cover_img)
                             disc_fake_out = net_disc(enc_img.detach())
                             loss_disc_real = gan_loss_fn(disc_real_out['global_disc'], True) * args.model_config.disc_model.global_weight + \
@@ -569,14 +524,14 @@ def train(args, device):
                         if model_engine.global_rank == 0:
                             current_global_step = model_engine.global_steps
                             writer.add_scalar('Validate (step) / Model_Loss_local', loss.item(), current_global_step + step)
-                            if args.loss_config.gan_loss.use:
+                            if args.loss_config.gan_loss.enabled:
                                 writer.add_scalar('Validate (step) / Disc_Loss_local', loss_net_disc.item(), current_global_step + step)
                             if (step + 1) % args.train_config.viz_freq_val_step == 0:
                                 viz_meta = {'epoch_num': epoch, 'step_num': current_global_step}
                                 save_viz(model_engine, epoch, cover_img, output, args, split_set="val", val_step=step)
                         # --- Step 3: Accumulate local results for the final aggregation ---
                         total_loss_model += loss.item() * B
-                        if args.loss_config.gan_loss.use:
+                        if args.loss_config.gan_loss.enabled:
                             total_loss_disc += loss_net_disc.item() * B
                         total_samples += B
                 # --- Step 4: Perform ONE aggregation at the end of the epoch ---
@@ -594,7 +549,7 @@ def train(args, device):
                     print(f"   Average Model Loss: {global_avg_loss_model:.4f}")
                     print(f"   Average Disc Loss: {global_avg_loss_disc:.4f}")
                     writer.add_scalar('Validate (epoch) / Model_Loss_global_avg', global_avg_loss_model, model_engine.global_steps)
-                    if args.loss_config.gan_loss.use:
+                    if args.loss_config.gan_loss.enabled:
                         writer.add_scalar('Validate (epoch) / Disc_Loss_global_avg', global_avg_loss_disc, model_engine.global_steps)
             validate_model()
 
@@ -607,7 +562,7 @@ def save_checkpoints(model_engine, disc_engine, args, epoch_num, step_num, split
         # Use the DeepSpeed save API
         save_model_dir = Path(args.train_config.checkpoints_savedir) / split_set / 'model'
         model_engine.save_checkpoint(save_dir=str(save_model_dir), tag=tag, client_state=client_state, exclude_frozen_parameters=False)
-        if args.loss_config.gan_loss.use and disc_engine is not None:
+        if args.loss_config.gan_loss.enabled and disc_engine is not None:
             save_net_disc_dir = Path(args.train_config.checkpoints_savedir) / split_set / 'net_disc'
             # The discriminator engine saves its own state
             disc_engine.save_checkpoint(save_dir=str(save_net_disc_dir), tag=tag, client_state=client_state, exclude_frozen_parameters=False)
@@ -674,7 +629,7 @@ def save_viz(model_engine, epoch, cover_img, output, args, split_set: Literal['t
                 viz_tensor_to_grey(valid_motion, args.train_config.checkpoints_savedir, 'viz', "valid_motion", epoch, model_engine.global_steps, split_set, val_step)
 
             # save the templates
-            if args.model_config.unified_template.use:
+            if args.model_config.unified_template.enabled:
                 if args.model_config.unified_template.viz_in_train:
                     viz_template(model_engine.module.unified_template.detach().float(), args.train_config.checkpoints_savedir, 'ut', "ut", epoch, model_engine.global_steps, split_set, val_step, args.model_config.unified_template.viz_mode)
             else:
@@ -686,81 +641,63 @@ def save_viz(model_engine, epoch, cover_img, output, args, split_set: Literal['t
         print(f"ERROR: Failed to save visualization. Reason: {e}")
 
 def main(args):
-    # =========================================================================
-    # Step 0: (Most critical!) Before any distributed initialization, force the network interface to be set up
-    # =========================================================================
-    # We suspect a higher-level configuration is overriding our NCCL settings.
-    # Let's force it from within the Python script itself, just before initialization.
+    # 1. Set Environment Variables
+    ## We suspect a higher-level configuration is overriding our NCCL settings.
     os.environ['NCCL_SOCKET_IFNAME'] = 'lo'
-    # ==========================================================================
-    # Step 1: Initialize the distributed environment and devices (all processes)
-    # ==========================================================================
+    
+    ## Initialize the distributed environment and devices (all processes)
     deepspeed.init_distributed()
     world_size = dist.get_world_size()     # Get the total number of processes involved in training (i.e., the total number of GPUs used)
     global_rank = dist.get_rank()    # Get the global rank of the current process
-
     local_rank = int(os.environ['LOCAL_RANK'])    # Get the rank of the current process on the current machine (GPU number)
     device = torch.device(f"cuda:{local_rank}")
     torch.cuda.set_device(device)
-    # update checkpoint dir with time suffix AND create directory
-    update_checkpoints_savedir(args.train_config)
-    # make deterministic
+
+    ## make deterministic
     make_deterministic(args.train_config.random_seed)
-    # ===========================================================================================
-    # Step 2: Place all setup tasks that should only be executed once into a block with rank == 0
-    # ===========================================================================================
-    # Only the master process (rank 0) performs file system operations and prints global information
+    
+    # 2. Update savedir
+    ## Update the ckpt_savedir
+    ckpt_savedir = update_checkpoints_savedir(log_dir=args.train_config.ckpt.log_dir,
+                                              ckpt_path=args.train_config.ckpt.read_path,
+                                              ckpt_savedir=args.train_config.ckpt.save_dir,
+                                              exp_name=args.train_config.ckpt.exp_name)
+    args.train_config.ckpt.save_dir = ckpt_savedir
+
+    ## 3. Save the args
     if global_rank == 0:    # Use "global_rank == 0" rather than "local_rank == 0" for more generality
-        print("Running on MASTER process (rank 0)... Performing setup.")
-        print(f"Distributed training initiated.")
-        print(f"--> World Size (Total GPUs Used): {world_size}")
-        print(f"--> GPUs visible on this node: {torch.cuda.device_count()}")
-        print("----------------------------------------------------")
-        # Print all arguments and their values
-        print(f"Master process is using {device}.")
         print_all_args(args)
-        # save args
         save_args_path = Path(args.train_config.checkpoints_savedir) / "config.json"
-        if save_args_path.exists():
-            print(f"config.json already exists in {args.train_config.checkpoints_savedir}.")
-        else:
-            save_namespace_to_json(args, save_args_path)
-    # ==============================================================================================================
-    # Step 3: Set the synchronization point, ensuring that rank 0 completes the setup before other processes proceed
-    # ==============================================================================================================
+        if save_args_path.exists(): print(f"config.json already exists in {args.train_config.checkpoints_savedir}.")
+        else: save_namespace_to_json(args, save_args_path)
     dist.barrier()
-    # ===========================================================
-    # Step 4: All processes work together to perform the training
-    # ===========================================================
-    # All processes (including rank 0) execute the train function
-    # DeepSpeed handles distributed initialization inside the train() function
+    
     train(args, device)
-    # At the end of training, only the main process prints the final message
+    
     if global_rank == 0:
         print('Finish Training')
-
+        
 def set_args():
     parser = argparse.ArgumentParser()
     # experiment settings
-    parser.add_argument('--data_config', default='core_v8_1/configs/data_config.json')
+    # parser.add_argument('--data_config', default='core_v8_1/configs/data_config.json')
     parser.add_argument('--loss_config', default='core_v8_1/configs/loss_config.json')
     parser.add_argument('--model_config', default='core_v8_1/configs/model_config.json')
     parser.add_argument('--train_config', default='core_v8_1/configs/train_config.json')
     parser.add_argument('--deepspeed_config', default='core_v8_1/configs/deepspeed_config.json')
     parser.add_argument('--unified_config', default=None)
-    # parser.add_argument('--unified_config', default='outputs/checkpoints/v8_1/exp20251025-present/pretrain-clean-sea_raft-no_cfmodel-nofreeze-mask_ones_prob0.7/20251026_205122/config.json')
     # Adding 'local_rank' here to prevent argparse from throwing an "unrecognized arguments" error.
     parser.add_argument('--local_rank', type=int, default=-1, help='local rank passed from distributed launcher')
     args = parse_args(parser)
     # Set up the config
     if args.unified_config is not None:
-        args.data_config = args.unified_config.data_config
+        # args.data_config = args.unified_config.data_config
         args.loss_config = args.unified_config.loss_config
         args.model_config = args.unified_config.model_config
         args.train_config = args.unified_config.train_config
         args.deepspeed_config = args.unified_config.deepspeed_config
         
-    if not args.loss_config.template_loss.use:
+    if not args.loss_config.template_loss.enabled:
         args.model_config.unified_template.calc_loss = False
         args.model_config.motion_template.calc_loss = False
         args.model_config.content_template.calc_loss = False

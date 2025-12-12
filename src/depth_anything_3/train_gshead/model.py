@@ -85,7 +85,7 @@ class DepthAnything3(nn.Module, PyTorchModelHubMixin):
         self.model_name = model_name
 
         # Build the underlying network
-        print(f"MODEL_REGISTRY: {MODEL_REGISTRY}")
+        # print(f"MODEL_REGISTRY: {MODEL_REGISTRY}")
         if 'align_3dgs' in kwargs.keys() and kwargs['align_3dgs']:
             print(f"kwargs['align_3dgs']: {kwargs['align_3dgs']}")
             self.model_name += '-align3dgs'
@@ -93,14 +93,10 @@ class DepthAnything3(nn.Module, PyTorchModelHubMixin):
         
         self.config = load_config(MODEL_REGISTRY[self.model_name])
         self.model = create_object(self.config)
-        self.model.eval()
 
         # Initialize processors
-        self.input_processor = InputProcessor()
         self.output_processor = OutputProcessor()
 
-        # Device management (set by user)
-        self.device = None
 
     @torch.inference_mode()
     def forward(
@@ -426,27 +422,3 @@ class DepthAnything3(nn.Module, PyTorchModelHubMixin):
         end_time = time.time()
         logger.info(f"Export Results Done. Time: {end_time - start_time} seconds")
 
-    def _get_model_device(self) -> torch.device:
-        """
-        Get the device where the model is located.
-
-        Returns:
-            Device where the model parameters are located
-
-        Raises:
-            ValueError: If no tensors are found in the model
-        """
-        if self.device is not None:
-            return self.device
-
-        # Find device from parameters
-        for param in self.parameters():
-            self.device = param.device
-            return param.device
-
-        # Find device from buffers
-        for buffer in self.buffers():
-            self.device = buffer.device
-            return buffer.device
-
-        raise ValueError("No tensor found in model")
